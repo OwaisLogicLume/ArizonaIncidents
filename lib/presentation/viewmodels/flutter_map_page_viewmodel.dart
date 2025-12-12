@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_map/flutter_map.dart';
@@ -22,6 +23,23 @@ class FlutterMapPageViewModel extends StateNotifier<FlutterMapPageState> {
   /// Clear error message
   void clearError() {
     state = state.clearError();
+  }
+
+  /// Zoom to current location (manual action)
+  void zoomToCurrentLocation() {
+    if (state.currentLocation == null) {
+      state = state.copyWith(errorMessage: 'Current location not available yet');
+      return;
+    }
+
+    if (_mapController != null) {
+      try {
+        _mapController!.move(state.currentLocation!, 15);
+        debugPrint('🎯 Zoomed to current location: ${state.currentLocation}');
+      } catch (e) {
+        debugPrint('Error zooming to location: $e');
+      }
+    }
   }
 
   /// Get current location with permissions
@@ -110,15 +128,10 @@ class FlutterMapPageViewModel extends StateNotifier<FlutterMapPageState> {
         isLoadingLocation: false,
       );
 
-      // Move map to current location
-      if (_mapController != null) {
-        await Future.delayed(Duration(milliseconds: 300));
-        try {
-          _mapController!.move(newLocation, 15);
-        } catch (mapError) {
-          debugPrint('Map move error: $mapError');
-        }
-      }
+      // DON'T automatically move map - let user see fire stations
+      // User can manually zoom to their location using the my_location button
+      debugPrint('✅ Current location marked on map at: ${newLocation.latitude}, ${newLocation.longitude}');
+      debugPrint('💡 Map stays at current view to show fire stations. Use My Location button to zoom.');
 
       // Clear status message after delay
       await Future.delayed(Duration(seconds: 2));
@@ -322,6 +335,147 @@ class FlutterMapPageViewModel extends StateNotifier<FlutterMapPageState> {
         debugPrint('Fallback move also failed: $fallbackError');
       }
     }
+  }
+
+  /// Get route to nearest fire station
+  Future<void> getRouteToNearestFireStation(List<LatLng> fireStationLocations) async {
+    if (state.currentLocation == null) {
+      state = state.copyWith(errorMessage: 'Current location not available. Please wait...');
+      return;
+    }
+
+    if (fireStationLocations.isEmpty) {
+      state = state.copyWith(errorMessage: 'No fire stations loaded. Please download fire stations first.');
+      return;
+    }
+
+    state = state.copyWith(
+      routePoints: [],
+      isLoadingRoute: true,
+      statusMessage: 'Finding nearest fire station...',
+      errorMessage: '',
+    );
+
+    try {
+      // Find nearest fire station
+      LatLng? nearestStation;
+      double minDistance = double.infinity;
+
+      for (var stationLocation in fireStationLocations) {
+        // Calculate distance using Haversine formula
+        double distance = _calculateDistance(
+          state.currentLocation!.latitude,
+          state.currentLocation!.longitude,
+          stationLocation.latitude,
+          stationLocation.longitude,
+        );
+
+        if (distance < minDistance) {
+          minDistance = distance;
+          nearestStation = stationLocation;
+        }
+      }
+
+      if (nearestStation == null) {
+        throw Exception('Could not find nearest fire station');
+      }
+
+      debugPrint('🔥 Nearest fire station found at: ${nearestStation.latitude}, ${nearestStation.longitude}');
+      debugPrint('📏 Distance: ${minDistance.toStringAsFixed(2)} km');
+
+      // Update status
+      state = state.copyWith(
+        destinationLocation: nearestStation,
+        statusMessage: 'Found nearest station (${minDistance.toStringAsFixed(1)} km away). Getting route...',
+      );
+
+      // Get route using OSRM
+      final routeUrl = Uri.parse(
+        'https://router.project-osrm.org/route/v1/driving/'
+            '${state.currentLocation!.longitude},${state.currentLocation!.latitude};'
+            '${nearestStation.longitude},${nearestStation.latitude}'
+            '?overview=full&geometries=geojson',
+      );
+
+      final routeResponse = await http.get(routeUrl);
+
+      if (routeResponse.statusCode != 200) {
+        throw Exception('Failed to get route');
+      }
+
+      final routeData = json.decode(routeResponse.body);
+      if (routeData['code'] != 'Ok') {
+        throw Exception('Route not found');
+      }
+
+      final coordinates = routeData['routes'][0]['geometry']['coordinates'] as List;
+      final distance = routeData['routes'][0]['distance'] / 1000; // Convert to km
+      final duration = routeData['routes'][0]['duration'] / 60; // Convert to minutes
+
+      // Convert coordinates to LatLng
+      List<LatLng> allPoints = coordinates
+          .map((coord) => LatLng(coord[1].toDouble(), coord[0].toDouble()))
+          .toList();
+
+      // Simplify route points if too many
+      List<LatLng> simplifiedPoints = [];
+      if (allPoints.length > 200) {
+        int step = (allPoints.length / 200).ceil();
+        for (int i = 0; i < allPoints.length; i += step) {
+          simplifiedPoints.add(allPoints[i]);
+        }
+        if (simplifiedPoints.last != allPoints.last) {
+          simplifiedPoints.add(allPoints.last);
+        }
+      } else {
+        simplifiedPoints = allPoints;
+      }
+
+      debugPrint('=== Route to Nearest Fire Station Calculated ===');
+      debugPrint('Distance: ${distance.toStringAsFixed(1)} km');
+      debugPrint('Duration: ${duration.toStringAsFixed(0)} min');
+
+      state = state.copyWith(
+        routePoints: simplifiedPoints,
+        statusMessage: 'Route to nearest fire station: ${distance.toStringAsFixed(1)} km, ${duration.toStringAsFixed(0)} min',
+        isLoadingRoute: false,
+      );
+
+      // Fit camera to show route
+      await _fitCameraToRoute();
+
+      // Keep message visible longer
+      await Future.delayed(Duration(seconds: 8));
+      state = state.copyWith(statusMessage: '');
+
+    } catch (e) {
+      state = state.copyWith(
+        errorMessage: 'Error finding route to fire station: ${e.toString()}',
+        isLoadingRoute: false,
+        statusMessage: '',
+      );
+      debugPrint('Error in getRouteToNearestFireStation: $e');
+    }
+  }
+
+  /// Calculate distance between two points using Haversine formula (in kilometers)
+  double _calculateDistance(double lat1, double lon1, double lat2, double lon2) {
+    const double earthRadius = 6371; // Earth's radius in kilometers
+
+    double dLat = _degreesToRadians(lat2 - lat1);
+    double dLon = _degreesToRadians(lon2 - lon1);
+
+    double a = sin(dLat / 2) * sin(dLat / 2) +
+        cos(_degreesToRadians(lat1)) * cos(_degreesToRadians(lat2)) *
+        sin(dLon / 2) * sin(dLon / 2);
+
+    double c = 2 * atan2(sqrt(a), sqrt(1 - a));
+
+    return earthRadius * c;
+  }
+
+  double _degreesToRadians(double degrees) {
+    return degrees * pi / 180;
   }
 
   /// Clear route and destination

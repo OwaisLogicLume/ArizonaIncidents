@@ -1,8 +1,14 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:hive_flutter/adapters.dart';
+import 'package:open_street_map/data/model/fire_station.dart';
 import 'package:open_street_map/presentation/pages/home_page.dart';
+import 'package:hive/hive.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Hive.initFlutter();
+  Hive.registerAdapter(FireStationAdapter());
   runApp(
     // Wrap the app with ProviderScope for Riverpod
     const ProviderScope(
